@@ -54,24 +54,6 @@
     to   { transform: none; opacity: 1; }
   }
 
-  /* Sound on/off button shown under the banner */
-  #soundRow { margin-top: 8px; }
-  #soundBtn {
-    min-height: 40px;
-    padding: 6px 14px;
-    border: 2px solid #2e1065;
-    border-radius: 999px;
-    background: #fff;
-    color: #2e1065;
-    font-size: 14px;
-    font-weight: 600;
-  }
-  #soundBtn.attn { animation: pulse 1s ease-in-out 3; }
-  @keyframes pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(124, 58, 237, .6); }
-    50%      { box-shadow: 0 0 0 8px rgba(124, 58, 237, 0); }
-  }
-
   /* ---------- Admin button + panel ---------- */
   #openBtn {
     min-height: 44px;
@@ -160,6 +142,19 @@
   .soundBtn:active { background: #efe7ff; }
 
   #setupError { font-size: 13px; color: #b00020; padding: 6px; }
+
+  /* Only shown when the address ends in ?debug=1 */
+  #debug {
+    margin-top: 8px;
+    padding: 8px;
+    background: #fff;
+    color: #222;
+    border: 1px solid #999;
+    border-radius: 6px;
+    font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
 </style>
 </head>
 <body>
@@ -170,9 +165,6 @@
 <div id="banner" class="hidden" role="status" aria-live="polite">
   <span id="bannerText"></span>
   <button id="bannerClose" type="button" aria-label="Dismiss">&#10005;</button>
-</div>
-<div id="soundRow" class="hidden">
-  <button id="soundBtn" type="button"></button>
 </div>
 
 <!-- Admin mode: ?mode=admin -->
@@ -214,6 +206,8 @@
   </div>
 </div>
 
+<div id="debug" class="hidden"></div>
+
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
   import { getDatabase, ref, onValue, set, goOffline, goOnline }
@@ -227,12 +221,30 @@
   const GITHUB_REPO = "";
   const GITHUB_BRANCH = "main";
 
+  const BUILD = "2026-11-20-e"; // shows up in ?debug=1 so you can tell which version a page is running
   const AUDIO_EXT = /\.(mp3|m4a|aac|wav|ogg|oga|opus|flac|weba)$/i;
   const SOUND_MAX_AGE_MS = 45000; // ignore sounds older than this (e.g. a phone that just woke up)
 
   let memDismissed = null; // fallback when the browser blocks storage inside embeds (common on iPhone/iPad)
   const $ = (id) => document.getElementById(id);
-  const mode = new URLSearchParams(location.search).get("mode") === "admin" ? "admin" : "banner";
+  const params = new URLSearchParams(location.search);
+  const mode = params.get("mode") === "admin" ? "admin" : "banner";
+
+  // ------------------------------------------------------------
+  // Debug box: add ?debug=1 to the page address to see what the page is doing
+  // ------------------------------------------------------------
+  const DEBUG = params.get("debug") === "1";
+  const debugLines = {};
+  function dbg(key, val) {
+    if (!DEBUG) return;
+    debugLines[key] = val;
+    const el = $("debug");
+    el.classList.remove("hidden");
+    el.textContent = Object.keys(debugLines).map((k) => k + ": " + debugLines[k]).join("\n");
+  }
+  window.addEventListener("error", (e) => dbg("script error", e.message));
+  window.addEventListener("unhandledrejection", (e) =>
+    dbg("promise error", String((e.reason && e.reason.message) || e.reason)));
 
   function showSetupError(msg) {
     const el = $("setupError");
@@ -241,17 +253,38 @@
   }
 
   async function main() {
+    dbg("build", BUILD);
+    dbg("mode", mode);
+    dbg("inside an iframe", String(window.self !== window.top));
+    dbg("sandboxed without same-origin", String(window.origin === "null"));
+    try {
+      localStorage.setItem("t", "1");
+      localStorage.removeItem("t");
+      dbg("browser storage", "works");
+    } catch (e) {
+      dbg("browser storage", "blocked (normal inside embeds)");
+    }
+
     let firebaseConfig;
     try {
-      ({ firebaseConfig } = await import("./firebase-config.js"));
+      // The ?v= part makes sure an old copy of the config is never reused.
+      ({ firebaseConfig } = await import("./firebase-config.js?v=" + Date.now()));
     } catch (e) {
+      dbg("config file", "failed to load: " + (e && e.message));
       showSetupError("Can't find firebase-config.js. Upload it to the same place as index.html.");
       return;
     }
-    if (!firebaseConfig || String(firebaseConfig.databaseURL || "").startsWith("PASTE")) {
+    if (!firebaseConfig) {
+      dbg("config file", "loaded, but it doesn't export firebaseConfig");
+      showSetupError("firebase-config.js needs to start with: export const firebaseConfig = {");
+      return;
+    }
+    if (String(firebaseConfig.databaseURL || "").startsWith("PASTE")) {
+      dbg("config file", "still has PASTE_ placeholders");
       showSetupError("Setup not finished: paste your Firebase config into firebase-config.js.");
       return;
     }
+    dbg("config file", "ok");
     const app = initializeApp(firebaseConfig);
     const db = getDatabase(app);
     if (mode === "admin") startAdmin(db);
@@ -288,11 +321,18 @@
     });
 
     // Live updates
-    onValue(ref(db, ".info/connected"), (snap) => { connected = snap.val() === true; });
+    onValue(ref(db, ".info/connected"), (snap) => {
+      connected = snap.val() === true;
+      dbg("live connection", connected ? "connected" : "not connected");
+    });
     onValue(
       ref(db, "message/public"),
-      (snap) => { lastData = snap.val(); render(lastData); },
-      (err) => console.error(err)
+      (snap) => {
+        lastData = snap.val();
+        dbg("current message", lastData ? JSON.stringify(lastData) : "(none)");
+        render(lastData);
+      },
+      (err) => { console.error(err); dbg("message error", (err && (err.code || err.message)) || String(err)); }
     );
 
     // Fallback: if the live connection isn't up (for example the free plan's
@@ -302,8 +342,11 @@
       if (connected || document.hidden) return;
       try {
         const r = await fetch(dbUrl.replace(/\/$/, "") + "/message/public.json", { cache: "no-store" });
+        dbg("fallback read", r.ok ? "ok" : "http " + r.status);
         if (r.ok) { lastData = await r.json(); render(lastData); }
-      } catch (e) { /* try again next time */ }
+      } catch (e) {
+        dbg("fallback read", "failed: " + (e && e.message));
+      }
     }
     poll();
     setInterval(poll, 30000);
@@ -331,9 +374,10 @@
 
   // ------------------------------------------------------------
   // Sound: plays whatever the admin picks, on every open page.
-  // Browsers (iPhone especially) refuse to play sound until the
-  // visitor taps something on the page, so there's a one-tap
-  // "turn on sound" button. After that, sounds play on their own.
+  // There's no button. The page asks the browser for permission to
+  // play sound as soon as it loads, and if the browser says "not
+  // until the visitor touches the page", it quietly gets permission
+  // the first time they tap, click or press a key on the box.
   // ------------------------------------------------------------
   function soundUrl(file) {
     if (typeof file !== "string" || !file.trim()) return null;
@@ -361,9 +405,6 @@
   }
 
   function startSound(db) {
-    const row = $("soundRow");
-    const btn = $("soundBtn");
-
     const audio = new Audio();
     audio.preload = "auto";
     let unlocked = false;   // has the browser allowed this page to make sound?
@@ -385,20 +426,7 @@
       GESTURES.forEach((t) => document.removeEventListener(t, unlock, true));
     }
 
-    // Only shown when the browser refuses to play sound without a tap.
-    function showPrompt(pulse) {
-      btn.textContent = "\u{1F507} Tap to turn on sound";
-      row.classList.remove("hidden");
-      if (pulse) {
-        btn.classList.remove("attn");
-        void btn.offsetWidth; // restart the pulse animation
-        btn.classList.add("attn");
-      }
-      addGestureListeners();
-    }
-
-    // Plays a silent blip. If the browser allows it, this page can make sound from now on,
-    // and the button goes away for good.
+    // Plays a silent blip. If the browser allows it, this page can make sound from now on.
     function unlock() {
       if (unlocked || unlocking) return;
       unlocking = true;
@@ -408,40 +436,48 @@
         .then(() => {
           unlocked = true;
           unlocking = false;
-          row.classList.add("hidden");
           removeGestureListeners();
+          dbg("sound allowed by browser", "yes");
         })
         .catch(() => {
           unlocking = false;
-          showPrompt(false);
+          addGestureListeners();
+          dbg("sound allowed by browser", "not yet (needs a tap or click on this box first)");
         });
     }
 
     function handleSound(v) {
       const id = v && typeof v.id === "number" ? v.id : null;
+      dbg("sound value", v ? JSON.stringify(v) : "(none)");
       // The first value we see is whatever was already there when the page loaded: don't play it.
       if (!baselineSet) { baselineSet = true; lastId = id; return; }
       if (id === null || id === lastId) return;
       lastId = id;
 
       if (!v.file) { audio.pause(); return; }               // admin pressed Stop
-      if (Date.now() - id > SOUND_MAX_AGE_MS) return;        // too old to matter
+      if (Date.now() - id > SOUND_MAX_AGE_MS) { dbg("last sound", "skipped (too old)"); return; }
       const url = soundUrl(v.file);
-      if (!url) return;
+      if (!url) { dbg("last sound", "skipped (bad file path)"); return; }
 
       audio.src = url;
       const p = audio.play();
-      if (p && p.catch) {
-        p.catch(() => { // browser said no: ask for a tap
-          unlocked = false;
-          showPrompt(true);
-        });
+      if (p && p.then) {
+        p.then(() => dbg("last sound", "playing " + v.file))
+         .catch((e) => {
+           unlocked = false;
+           addGestureListeners(); // the next tap on the box will allow sound again
+           dbg("last sound", "blocked by the browser (" + ((e && e.name) || "error") + ")");
+         });
       }
     }
 
-    onValue(ref(db, "sound/public"), (snap) => handleSound(snap.val()), (err) => console.error(err));
+    onValue(
+      ref(db, "sound/public"),
+      (snap) => handleSound(snap.val()),
+      (err) => { console.error(err); dbg("sound error", (err && (err.code || err.message)) || String(err)); }
+    );
 
-    // Try to switch sound on right away. Some browsers allow it; if not, the tap prompt appears.
+    // Ask for sound permission right away. Some browsers say yes.
     unlock();
   }
 
